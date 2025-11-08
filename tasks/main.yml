@@ -1,0 +1,269 @@
+---
+- name: Ensure kubeconfig file exists
+  ansible.builtin.stat:
+    path: "{{ awx_operator_kubeconfig }}"
+  register: __awx_kubeconfig
+
+- name: Fail if kubeconfig is missing
+  ansible.builtin.fail:
+    msg: "Kubeconfig file not found at {{ awx_operator_kubeconfig }}. Please run k8s-host-setup first."
+  when: not __awx_kubeconfig.stat.exists
+
+- name: Ensure AWX namespace exists
+  kubernetes.core.k8s:
+    api_version: v1
+    kind: Namespace
+    name: "{{ awx_operator_namespace }}"
+    state: present
+    kubeconfig: "{{ awx_operator_kubeconfig }}"
+
+- name: Validate MicroK8s cluster nodes
+  ansible.builtin.command:
+    cmd: "sg microk8s -c 'microk8s kubectl get nodes --no-headers'"
+  become: true
+  become_user: "{{ awx_operator_admin_user }}"
+  environment:
+    PATH: "/snap/bin:{{ ansible_env.PATH }}"
+  register: __awx_operator_nodes
+  changed_when: false
+  failed_when: >
+    __awx_operator_nodes.rc != 0 or
+    (
+      __awx_operator_nodes.stdout_lines | length > 0 and
+      (
+        __awx_operator_nodes.stdout_lines | reject("search", "\\bReady\\b") | list | length > 0
+      )
+    )
+
+- name: Display MicroK8s node status (operator preflight)
+  when: awx_operator_display_status | bool and __awx_operator_nodes.stdout_lines | length > 0
+  ansible.builtin.debug:
+    msg: "{{ __awx_operator_nodes.stdout_lines }}"
+
+- name: Validate MicroK8s system pods
+  ansible.builtin.command:
+    cmd: "sg microk8s -c 'microk8s kubectl get pods -A --no-headers'"
+  become: true
+  become_user: "{{ awx_operator_admin_user }}"
+  environment:
+    PATH: "/snap/bin:{{ ansible_env.PATH }}"
+  register: __awx_operator_pods
+  changed_when: false
+  failed_when: __awx_operator_pods.rc != 0
+
+- name: Display MicroK8s pod status (operator preflight)
+  when: awx_operator_display_status | bool and __awx_operator_pods.stdout_lines | length > 0
+  ansible.builtin.debug:
+    msg: "{{ __awx_operator_pods.stdout_lines }}"
+
+- name: Ensure operator bundle directory exists
+  ansible.builtin.file:
+    path: "{{ awx_operator_bundle_path }}"
+    state: directory
+    mode: "0755"
+  become: true
+
+- name: Download AWX Operator release tarball
+  ansible.builtin.get_url:
+    url: "{{ awx_operator_release_url }}"
+    dest: "{{ awx_operator_release_archive }}"
+    mode: "0644"
+  become: true
+
+- name: Extract AWX Operator bundle
+  ansible.builtin.unarchive:
+    src: "{{ awx_operator_release_archive }}"
+    dest: "{{ awx_operator_bundle_path }}"
+    remote_src: true
+    extra_opts:
+      - "--strip-components=1"
+  become: true
+
+- name: Deploy AWX Operator via MicroK8s kustomize
+  ansible.builtin.command:
+    cmd: "sg microk8s -c 'microk8s kubectl apply -k {{ awx_operator_kustomize_path }}'"
+  become: true
+  become_user: "{{ awx_operator_admin_user }}"
+  environment:
+    PATH: "/snap/bin:{{ ansible_env.PATH }}"
+  register: __awx_operator_apply
+  changed_when: __awx_operator_apply.stdout is search(' (configured|created)')
+
+- name: Wait for AWX Operator deployment to be ready
+  kubernetes.core.k8s_info:
+    api_version: apps/v1
+    kind: Deployment
+    name: awx-operator-controller-manager
+    namespace: "{{ awx_operator_namespace }}"
+    kubeconfig: "{{ awx_operator_kubeconfig }}"
+  register: awx_operator_deployment
+  until: awx_operator_deployment.resources | length > 0 and (awx_operator_deployment.resources[0].status.readyReplicas | default(0)) | int > 0
+  retries: "{{ (awx_operator_wait_timeout // awx_wait_delay) | int }}"
+  delay: "{{ awx_wait_delay }}"
+
+- name: Show current AWX operator pods
+  when: awx_operator_display_status | bool
+  block:
+    - name: Collect AWX operator pods
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Pod
+        label_selectors:
+          - control-plane=controller-manager
+        namespace: "{{ awx_operator_namespace }}"
+        kubeconfig: "{{ awx_operator_kubeconfig }}"
+      register: __awx_operator_pods
+
+    - name: Display AWX operator pod status
+      ansible.builtin.debug:
+        msg: "Pod {{ item.metadata.name }} phase={{ item.status.phase }}"
+      loop: "{{ __awx_operator_pods.resources }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+
+- name: Deploy AWX custom resource
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: awx.ansible.com/v1beta1
+      kind: AWX
+      metadata:
+        name: "{{ awx_instance_name }}"
+        namespace: "{{ awx_operator_namespace }}"
+      spec: "{{ awx_instance_spec }}"
+    kubeconfig: "{{ awx_operator_kubeconfig }}"
+
+- name: Wait for AWX web deployment to be ready
+  kubernetes.core.k8s_info:
+    api_version: apps/v1
+    kind: Deployment
+    name: "{{ awx_instance_name }}-web"
+    namespace: "{{ awx_operator_namespace }}"
+    kubeconfig: "{{ awx_operator_kubeconfig }}"
+  register: __awx_web_deployment
+  until: __awx_web_deployment.resources | length > 0 and (__awx_web_deployment.resources[0].status.readyReplicas | default(0)) | int > 0
+  retries: "{{ (awx_wait_timeout // awx_wait_delay) | int }}"
+  delay: "{{ awx_wait_delay }}"
+
+- name: Show AWX managed pods
+  when: awx_operator_display_status | bool
+  block:
+    - name: Gather pods managed by AWX operator
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Pod
+        label_selectors:
+          - app.kubernetes.io/managed-by=awx-operator
+        namespace: "{{ awx_operator_namespace }}"
+        kubeconfig: "{{ awx_operator_kubeconfig }}"
+      register: __awx_managed_pods
+
+    - name: Display pod readiness states
+      ansible.builtin.debug:
+        msg: >-
+          Pod {{ item.metadata.name }} containers={{ item.status.containerStatuses | default([]) |
+          map(attribute='name') | list }} ready={{ item.status.containerStatuses | default([]) |
+          selectattr('ready') | list | length }}/{{ item.status.containerStatuses | default([]) | length }}
+      loop: "{{ __awx_managed_pods.resources }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+
+- name: Gather AWX service information
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Service
+    name: "{{ awx_instance_name }}-service"
+    namespace: "{{ awx_operator_namespace }}"
+    kubeconfig: "{{ awx_operator_kubeconfig }}"
+  register: __awx_service
+  failed_when: false
+
+- name: Display AWX service endpoints
+  ansible.builtin.debug:
+    msg: "{{ __awx_service.resources | map(attribute='spec') | list }}"
+  when: awx_operator_display_status | bool and __awx_service.resources | length > 0
+
+- name: Compute AWX service access details
+  when: __awx_service.resources | length > 0
+  block:
+    - name: Derive AWX service metadata
+      ansible.builtin.set_fact:
+        __awx_service_spec: "{{ __awx_service.resources[0].spec | default({}) }}"
+        __awx_service_status: "{{ __awx_service.resources[0].status | default({}) }}"
+
+    - name: Build AWX endpoint hint
+      ansible.builtin.set_fact:
+        awx_access_message: >-
+          {%- set svc_type = __awx_service_spec.type | default('ClusterIP') -%}
+          {%- set ports = __awx_service_spec.ports | default([]) -%}
+          {%- set lb_ingress = __awx_service_status.loadBalancer.ingress | default([]) -%}
+          {%- if svc_type == 'NodePort' and ports | length > 0 and ports[0].nodePort is defined -%}
+          AWX available via NodePort. Access URL: http://{{ awx_operator_access_host }}:{{ ports[0].nodePort }}
+          {%- elif svc_type == 'LoadBalancer' and lb_ingress | length > 0 -%}
+          AWX available via LoadBalancer. Access URL: http://{{ lb_ingress[0].hostname | default(lb_ingress[0].ip, true) }}:{{ ports[0].port | default(80) }}
+          {%- elif svc_type == 'ClusterIP' and ports | length > 0 -%}
+          AWX service is ClusterIP ({{ __awx_service_spec.clusterIP | default('N/A') }}).
+          Run on the controller host: microk8s kubectl port-forward svc/{{ awx_instance_name }}-service -n {{ awx_operator_namespace }} --address 0.0.0.0 {{ awx_operator_port_forward_port }}:{{ ports[0].port }}
+          Access URL after forwarding: http://{{ awx_operator_access_host }}:{{ awx_operator_port_forward_port }}
+          {%- else -%}
+          Unable to determine AWX service endpoint automatically. Inspect service {{ awx_instance_name }}-service in namespace {{ awx_operator_namespace }}.
+          {%- endif -%}
+
+    - name: Display AWX access endpoint
+      ansible.builtin.debug:
+        msg: "{{ awx_access_message | trim }}"
+
+- name: Retrieve AWX admin password secret
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Secret
+    name: "{{ awx_instance_name }}-admin-password"
+    namespace: "{{ awx_operator_namespace }}"
+    kubeconfig: "{{ awx_operator_kubeconfig }}"
+  register: __awx_admin_secret
+
+- name: Expose AWX admin credentials
+  set_fact:
+    awx_admin_password: "{{ (__awx_admin_secret.resources[0].data.password | b64decode) if __awx_admin_secret.resources | length > 0 else '' }}"
+
+- name: Display AWX admin password
+  ansible.builtin.debug:
+    msg:
+      - "AWX URL: {{ awx_access_message | trim }}"
+      - "AWX admin user: admin"
+      - "AWX admin password: {{ awx_admin_password }}"
+  when: awx_admin_password | length > 0
+
+- name: Configure persistent port-forward service for ClusterIP exposure
+  when:
+    - awx_operator_port_forward_enabled | bool
+    - (__awx_service.resources | length > 0)
+    - (__awx_service.resources[0].spec.type | default('ClusterIP')) == 'ClusterIP'
+  block:
+    - name: Ensure AWX port-forward Unit directory exists
+      ansible.builtin.file:
+        path: /etc/systemd/system
+        state: directory
+        mode: "0755"
+      become: true
+
+    - name: Deploy AWX web systemd service
+      ansible.builtin.template:
+        src: awx-web.service.j2
+        dest: /etc/systemd/system/awx-web.service
+        owner: root
+        group: root
+        mode: "0644"
+      become: true
+
+    - name: Reload systemd daemon
+      ansible.builtin.systemd:
+        daemon_reload: true
+      become: true
+
+    - name: Enable and start AWX web service
+      ansible.builtin.systemd:
+        name: awx-web.service
+        state: started
+        enabled: true
+      become: true

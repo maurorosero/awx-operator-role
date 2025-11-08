@@ -1,0 +1,12 @@
+# Ansible artifacts
+*.retry
+*.log
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Editor files
+.DS_Store
+*.swp
+

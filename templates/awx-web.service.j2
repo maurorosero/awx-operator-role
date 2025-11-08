@@ -1,0 +1,17 @@
+[Unit]
+Description=AWX web exposure (kubectl port-forward)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={{ awx_operator_admin_user }}
+Group={{ awx_operator_admin_user }}
+Environment=KUBECONFIG={{ awx_operator_kubeconfig }}
+ExecStart=/usr/bin/env sg microk8s -c "microk8s kubectl port-forward svc/{{ awx_instance_name }}-service -n {{ awx_operator_namespace }} {{ awx_operator_port_forward_extra_args }} {{ awx_operator_port_forward_port }}:{{ __awx_service.resources[0].spec.ports[0].port }}"
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+

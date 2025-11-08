@@ -1,0 +1,49 @@
+---
+# Namespace where the AWX Operator and AWX instance will reside.
+awx_operator_namespace: awx
+
+# Version of the AWX Operator to deploy via upstream manifests.
+awx_operator_version: "2.19.1"
+
+# Upstream release artifact (tarball) and extraction path for the AWX Operator sources.
+awx_operator_release_url: "https://github.com/ansible/awx-operator/archive/refs/tags/{{ awx_operator_version }}.tar.gz"
+awx_operator_release_archive: "/tmp/awx-operator-{{ awx_operator_version }}.tar.gz"
+awx_operator_bundle_path: "/opt/awx-operator-{{ awx_operator_version }}"
+awx_operator_kustomize_path: "{{ awx_operator_bundle_path }}/config/default"
+
+# Admin user expected to interact with Kubernetes (inherits Ansible remote user).
+awx_operator_admin_user: "{{ ansible_user }}"
+
+# Path to the kubeconfig used to manage the cluster.
+awx_operator_kubeconfig: "/home/{{ awx_operator_admin_user }}/.kube/config"
+
+# Name of the AWX custom resource instance to create.
+awx_instance_name: awx
+
+# Spec to apply to the AWX custom resource. Override in playbook/group/host vars as needed.
+awx_instance_spec:
+  service_type: ClusterIP
+  ingress_type: none
+
+# Wait configuration for AWX web deployment readiness (in seconds).
+awx_wait_timeout: 900
+awx_wait_delay: 15
+
+# Extra time (seconds) to wait for the AWX operator pods to stabilize.
+awx_operator_wait_timeout: 600
+
+# Whether to gather and print pod/service status for troubleshooting.
+awx_operator_display_status: true
+
+# Hostname or IP advertised when suggesting AWX access (defaults to target host).
+awx_operator_access_host: "{{ hostvars[inventory_hostname].ansible_host | default(inventory_hostname) }}"
+
+# Local port to use when suggesting port-forward instructions for ClusterIP services.
+awx_operator_port_forward_port: 8043
+
+# Enable automatic setup of a systemd-managed port-forward service for ClusterIP exposure.
+awx_operator_port_forward_enabled: true
+
+# Additional arguments for the kubectl port-forward command (spaced string).
+awx_operator_port_forward_extra_args: "--address 0.0.0.0"
+
