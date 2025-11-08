@@ -19,6 +19,6 @@ galaxy_info:
     - kubernetes
     - microk8s
     - operator
-dependencies:
+collections:
   - kubernetes.core
 
