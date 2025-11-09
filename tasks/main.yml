@@ -248,27 +248,6 @@
       - "AWX admin password: {{ awx_admin_password }}"
   when: awx_admin_password | length > 0
 
-- name: Registrar credenciales en AWX
-  when:
-    - awx_controller_url | default('') | length > 0
-    - awx_admin_password | default('') | length > 0
-  block:
-    - name: Derivar credenciales SSH del servidor
-      ansible.builtin.set_fact:
-        awx_machine_cred_username: "{{ ansible_user | default(ansible_ssh_user | default('')) }}"
-        awx_machine_cred_password: "{{ ansible_password | default(ansible_ssh_pass | default('')) }}"
-
-    - name: Crear credenciales en AWX
-      ansible.builtin.include_tasks: "{{ playbook_dir }}/../includes/awx_register_credentials.yml"
-      vars:
-        awx_register_controller_url: "{{ awx_controller_url }}"
-        awx_register_validate_certs: "{{ awx_controller_validate_certs | default(false) }}"
-        awx_register_admin_password: "{{ awx_admin_password }}"
-        awx_register_controller_user: "admin"
-        awx_register_machine_username: "{{ awx_machine_cred_username | default('') }}"
-        awx_register_machine_password: "{{ awx_machine_cred_password | default('') }}"
-        awx_register_organization: "{{ awx_credential_organization | default('') }}"
-
 - name: Configure persistent port-forward service for ClusterIP exposure
   when:
     - awx_operator_port_forward_enabled | bool
