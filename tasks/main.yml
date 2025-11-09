@@ -238,7 +238,7 @@
 
 - name: Expose AWX admin credentials
   set_fact:
-    awx_admin_password: "{{ (__awx_admin_secret.resources[0].data.password | b64decode) if __awx_admin_secret.resources | length > 0 else '' }}"
+    awx_admin_password: "{{ (__awx_admin_secret.resources[0].data.password | b64decode | regex_replace('\\s+$', '')) if __awx_admin_secret.resources | length > 0 else '' }}"
 
 - name: Display AWX admin password
   ansible.builtin.debug:
