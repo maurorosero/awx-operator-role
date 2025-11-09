@@ -191,23 +191,37 @@
         __awx_service_spec: "{{ __awx_service.resources[0].spec | default({}) }}"
         __awx_service_status: "{{ __awx_service.resources[0].status | default({}) }}"
 
+    - name: Preparar datos de servicio para endpoint
+      ansible.builtin.set_fact:
+        __awx_service_type: "{{ __awx_service_spec.type | default('ClusterIP') }}"
+        __awx_service_ports: "{{ __awx_service_spec.ports | default([]) }}"
+        __awx_service_ingress: "{{ __awx_service_status.loadBalancer.ingress | default([]) }}"
+
     - name: Build AWX endpoint hint
       ansible.builtin.set_fact:
         awx_access_message: >-
-          {%- set svc_type = __awx_service_spec.type | default('ClusterIP') -%}
-          {%- set ports = __awx_service_spec.ports | default([]) -%}
-          {%- set lb_ingress = __awx_service_status.loadBalancer.ingress | default([]) -%}
-          {%- if svc_type == 'NodePort' and ports | length > 0 and ports[0].nodePort is defined -%}
-          AWX available via NodePort. Access URL: http://{{ awx_operator_access_host }}:{{ ports[0].nodePort }}
-          {%- elif svc_type == 'LoadBalancer' and lb_ingress | length > 0 -%}
-          AWX available via LoadBalancer. Access URL: http://{{ lb_ingress[0].hostname | default(lb_ingress[0].ip, true) }}:{{ ports[0].port | default(80) }}
-          {%- elif svc_type == 'ClusterIP' and ports | length > 0 -%}
+          {%- if __awx_service_type == 'NodePort' and __awx_service_ports | length > 0 and __awx_service_ports[0].nodePort is defined -%}
+          AWX available via NodePort. Access URL: http://{{ awx_operator_access_host }}:{{ __awx_service_ports[0].nodePort }}
+          {%- elif __awx_service_type == 'LoadBalancer' and __awx_service_ingress | length > 0 -%}
+          AWX available via LoadBalancer. Access URL: http://{{ __awx_service_ingress[0].hostname | default(__awx_service_ingress[0].ip, true) }}:{{ __awx_service_ports[0].port | default(80) }}
+          {%- elif __awx_service_type == 'ClusterIP' and __awx_service_ports | length > 0 -%}
           AWX service is ClusterIP ({{ __awx_service_spec.clusterIP | default('N/A') }}).
-          Run on the controller host: microk8s kubectl port-forward svc/{{ awx_instance_name }}-service -n {{ awx_operator_namespace }} --address 0.0.0.0 {{ awx_operator_port_forward_port }}:{{ ports[0].port }}
+          Run on the controller host: microk8s kubectl port-forward svc/{{ awx_instance_name }}-service -n {{ awx_operator_namespace }} --address 0.0.0.0 {{ awx_operator_port_forward_port }}:{{ __awx_service_ports[0].port }}
           Access URL after forwarding: http://{{ awx_operator_access_host }}:{{ awx_operator_port_forward_port }}
           {%- else -%}
           Unable to determine AWX service endpoint automatically. Inspect service {{ awx_instance_name }}-service in namespace {{ awx_operator_namespace }}.
           {%- endif -%}
+        awx_controller_url: >-
+          {%- if __awx_service_type == 'NodePort' and __awx_service_ports | length > 0 and __awx_service_ports[0].nodePort is defined -%}
+          http://{{ awx_operator_access_host }}:{{ __awx_service_ports[0].nodePort }}
+          {%- elif __awx_service_type == 'LoadBalancer' and __awx_service_ingress | length > 0 -%}
+          http://{{ __awx_service_ingress[0].hostname | default(__awx_service_ingress[0].ip, true) }}:{{ __awx_service_ports[0].port | default(80) }}
+          {%- elif __awx_service_type == 'ClusterIP' and __awx_service_ports | length > 0 -%}
+          http://{{ awx_operator_access_host }}:{{ awx_operator_port_forward_port }}
+          {%- else -%}
+          {{ awx_controller_url | default('') }}
+          {%- endif -%}
+        awx_controller_validate_certs: false
 
     - name: Display AWX access endpoint
       ansible.builtin.debug:
@@ -233,6 +247,27 @@
       - "AWX admin user: admin"
       - "AWX admin password: {{ awx_admin_password }}"
   when: awx_admin_password | length > 0
+
+- name: Registrar credenciales en AWX
+  when:
+    - awx_controller_url | default('') | length > 0
+    - awx_admin_password | default('') | length > 0
+  block:
+    - name: Derivar credenciales SSH del servidor
+      ansible.builtin.set_fact:
+        awx_machine_cred_username: "{{ ansible_user | default(ansible_ssh_user | default('')) }}"
+        awx_machine_cred_password: "{{ ansible_password | default(ansible_ssh_pass | default('')) }}"
+
+    - name: Crear credenciales en AWX
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/../includes/awx_register_credentials.yml"
+      vars:
+        awx_register_controller_url: "{{ awx_controller_url }}"
+        awx_register_validate_certs: "{{ awx_controller_validate_certs | default(false) }}"
+        awx_register_admin_password: "{{ awx_admin_password }}"
+        awx_register_controller_user: "admin"
+        awx_register_machine_username: "{{ awx_machine_cred_username | default('') }}"
+        awx_register_machine_password: "{{ awx_machine_cred_password | default('') }}"
+        awx_register_organization: "{{ awx_credential_organization | default('') }}"
 
 - name: Configure persistent port-forward service for ClusterIP exposure
   when:
