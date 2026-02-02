@@ -47,3 +47,31 @@ awx_operator_port_forward_enabled: true
 # Additional arguments for the kubectl port-forward command (spaced string).
 awx_operator_port_forward_extra_args: "--address 0.0.0.0"
 
+# --- HTTPS / Ingress TLS (when awx_use_https is true) ---
+awx_use_https: false
+awx_ingress_hostname: ""
+awx_ingress_tls_secret: ""
+# Cloudflare DNS-01: dns_provider=cloudflare, credenciales en acme_plugin_data (solo desde SOPS).
+dns_provider: ""
+acme_plugin_data: ""
+# cert_manager=true: cert-manager HTTP-01 sin Cloudflare.
+cert_manager: false
+# ACME (Let's Encrypt) cuando cert_manager o Cloudflare.
+awx_ingress_acme_email: ""
+awx_ingress_acme_server: "https://acme-v02.api.letsencrypt.org/directory"
+# Ruta a certificados: el rol crea el Secret TLS desde estos archivos.
+awx_ingress_tls_cert_path: ""
+awx_ingress_tls_key_path: ""
+# Validación de cert en post_tasks (default true con HTTPS; false con autofirmado).
+awx_controller_validate_certs: true
+
+# cert-manager: versión a instalar cuando cert_manager es true o dns_provider es cloudflare.
+cert_manager_version: "v1.19.2"
+cert_manager_manifest_url: "https://github.com/cert-manager/cert-manager/releases/download/{{ cert_manager_version }}/cert-manager.yaml"
+
+# Esperar al Secret TLS creado por cert-manager antes de desplegar el CR AWX (emisión puede tardar varios minutos).
+awx_ingress_wait_for_tls_secret: true
+# 36 × 10 s ≈ 6 min; ajustar con awx_ingress_wait_tls_retries si hace falta más.
+awx_ingress_wait_tls_retries: 36
+awx_ingress_wait_tls_delay: 10
+

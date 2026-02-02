@@ -121,6 +121,340 @@
       loop_control:
         label: "{{ item.metadata.name }}"
 
+# --- HTTPS: validar vars cuando awx_use_https ---
+# RFC 1123: nombre válido en K8s = solo [a-z0-9], '-' o '.', debe empezar y terminar con alfanumérico (sin '_').
+- name: Validate HTTPS vars when using HTTPS
+  when: awx_use_https | bool
+  block:
+    - name: Require hostname and TLS secret name for HTTPS
+      ansible.builtin.assert:
+        that:
+          - awx_ingress_hostname | length > 0
+          - awx_ingress_tls_secret | length > 0
+        fail_msg: "Cuando awx_use_https es true se requieren awx_ingress_hostname y awx_ingress_tls_secret."
+
+    - name: Validate TLS secret name is RFC 1123 (lowercase alphanumeric, hyphen or dot only; no underscore)
+      ansible.builtin.assert:
+        that: awx_ingress_tls_secret is match('^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$')
+        fail_msg: "awx_ingress_tls_secret debe ser RFC 1123: solo minúsculas, números, '-' o '.', sin '_'. Ejemplo: awx-tls o awx02-secrets."
+
+    - name: Require acme_plugin_data when dns_provider is cloudflare
+      ansible.builtin.assert:
+        that: acme_plugin_data is defined and (acme_plugin_data | length > 0 if acme_plugin_data is string else acme_plugin_data | length > 0)
+        fail_msg: "Cuando dns_provider es cloudflare se requiere acme_plugin_data (desde SOPS)."
+      when: (dns_provider | default('')) == 'cloudflare'
+
+    - name: Require ACME email when cert_manager is true without Cloudflare
+      ansible.builtin.assert:
+        that: awx_ingress_acme_email | default('') | length > 0
+        fail_msg: "Cuando cert_manager es true se requiere awx_ingress_acme_email."
+      when: cert_manager | bool and (dns_provider | default('')) != 'cloudflare'
+
+    - name: Require cert and key paths when using path-based TLS
+      ansible.builtin.assert:
+        that:
+          - awx_ingress_tls_cert_path | default('') | length > 0
+          - awx_ingress_tls_key_path | default('') | length > 0
+        fail_msg: "Para TLS desde archivos se requieren awx_ingress_tls_cert_path y awx_ingress_tls_key_path."
+      when: >
+        awx_use_https | bool
+        and (dns_provider | default('')) != 'cloudflare'
+        and not (cert_manager | bool)
+        and (awx_ingress_tls_cert_path | default('') | length > 0 or awx_ingress_tls_key_path | default('') | length > 0)
+
+# --- HTTPS: aprovisionar TLS (Secret o Certificate) antes del CR ---
+- name: Provision self-signed TLS secret when HTTPS and no Cloudflare/cert_manager/path
+  when: >
+    awx_use_https | bool
+    and (dns_provider | default('')) != 'cloudflare'
+    and not (cert_manager | bool)
+    and (awx_ingress_tls_cert_path | default('') | length == 0 or awx_ingress_tls_key_path | default('') | length == 0)
+  block:
+    - name: Generate self-signed certificate and key
+      ansible.builtin.shell: |
+        openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+          -keyout /tmp/awx-ingress-tls.key -out /tmp/awx-ingress-tls.crt \
+          -subj "/CN={{ awx_ingress_hostname }}"
+      args:
+        creates: /tmp/awx-ingress-tls.crt
+      become: false
+
+    - name: Read generated certificate
+      ansible.builtin.slurp:
+        src: /tmp/awx-ingress-tls.crt
+      register: __awx_tls_cert_slurp
+
+    - name: Read generated key
+      ansible.builtin.slurp:
+        src: /tmp/awx-ingress-tls.key
+      register: __awx_tls_key_slurp
+
+    - name: Create TLS secret from self-signed cert
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ awx_ingress_tls_secret }}"
+            namespace: "{{ awx_operator_namespace }}"
+          type: kubernetes.io/tls
+          data:
+            tls.crt: "{{ __awx_tls_cert_slurp.content }}"
+            tls.key: "{{ __awx_tls_key_slurp.content }}"
+        kubeconfig: "{{ awx_operator_kubeconfig }}"
+
+- name: Provision TLS secret from cert/key files when path mode
+  when: >
+    awx_use_https | bool
+    and (awx_ingress_tls_cert_path | default('') | length > 0)
+    and (awx_ingress_tls_key_path | default('') | length > 0)
+  block:
+    - name: Read certificate file
+      ansible.builtin.slurp:
+        src: "{{ awx_ingress_tls_cert_path }}"
+      register: __awx_tls_cert_slurp
+
+    - name: Read key file
+      ansible.builtin.slurp:
+        src: "{{ awx_ingress_tls_key_path }}"
+      register: __awx_tls_key_slurp
+
+    - name: Create TLS secret from cert/key files
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ awx_ingress_tls_secret }}"
+            namespace: "{{ awx_operator_namespace }}"
+          type: kubernetes.io/tls
+          data:
+            tls.crt: "{{ __awx_tls_cert_slurp.content }}"
+            tls.key: "{{ __awx_tls_key_slurp.content }}"
+        kubeconfig: "{{ awx_operator_kubeconfig }}"
+
+# --- HTTPS: instalar cert-manager cuando cert_manager o dns_provider=cloudflare ---
+- name: Install cert-manager when cert_manager or Cloudflare DNS-01 is used
+  when: >
+    awx_use_https | bool
+    and (cert_manager | bool or (dns_provider | default('')) == 'cloudflare')
+  block:
+    - name: Ensure cert-manager namespace exists
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: cert-manager
+        kubeconfig: "{{ awx_operator_kubeconfig }}"
+
+    - name: Apply cert-manager manifest (CRDs and deployment)
+      ansible.builtin.command:
+        cmd: "sg microk8s -c 'KUBECONFIG={{ awx_operator_kubeconfig }} microk8s kubectl apply -f {{ cert_manager_manifest_url }}'"
+      environment:
+        PATH: "/snap/bin:/usr/local/bin:/usr/bin:/bin"
+      register: __cert_manager_apply
+      changed_when: "'configured' in __cert_manager_apply.stdout or 'created' in __cert_manager_apply.stdout"
+      failed_when: __cert_manager_apply.rc != 0
+
+    - name: Wait for cert-manager deployment to be ready
+      kubernetes.core.k8s_info:
+        api_version: apps/v1
+        kind: Deployment
+        namespace: cert-manager
+        label_selectors:
+          - app.kubernetes.io/name=cert-manager
+        kubeconfig: "{{ awx_operator_kubeconfig }}"
+      register: __cert_manager_deploy
+      until: >
+        __cert_manager_deploy.resources | length > 0
+        and (__cert_manager_deploy.resources[0].status.readyReplicas | default(0)) | int > 0
+      retries: 30
+      delay: 10
+
+    - name: Wait for cert-manager webhook to be ready
+      kubernetes.core.k8s_info:
+        api_version: apps/v1
+        kind: Deployment
+        name: cert-manager-webhook
+        namespace: cert-manager
+        kubeconfig: "{{ awx_operator_kubeconfig }}"
+      register: __cert_manager_webhook
+      until: >
+        __cert_manager_webhook.resources | length > 0
+        and (__cert_manager_webhook.resources[0].status.readyReplicas | default(0)) | int > 0
+      retries: 30
+      delay: 10
+
+# --- HTTPS: Cloudflare (dns_provider=cloudflare): Secret de credenciales + ClusterIssuer DNS-01 + Certificate ---
+# El Secret de credenciales Cloudflare es usado por cert-manager para emisión y renovaciones; debe persistir.
+- name: Provision TLS via cert-manager Cloudflare DNS-01 when dns_provider is cloudflare
+  when: awx_use_https | bool and (dns_provider | default('')) == 'cloudflare'
+  block:
+    # acme_plugin_data puede ser dict (CF_Token/api_token) o string con líneas CF_Token=... (formato SOPS/env).
+    - name: Set Cloudflare API token from acme_plugin_data (dict o string tipo CF_Token=...)
+      ansible.builtin.set_fact:
+        __cf_api_token: "{{ __cf_api_token_parsed }}"
+      vars:
+        __cf_from_dict: "{{ (acme_plugin_data.CF_Token | default(acme_plugin_data.cf_token | default(acme_plugin_data.api_token | default('')))) if (acme_plugin_data is mapping) else '' }}"
+        __cf_line_token: "{{ (acme_plugin_data | default('')).split('\n') | select('match', '^CF_Token=') | list | first | default('') }}"
+        __cf_line_apitoken: "{{ (acme_plugin_data | default('')).split('\n') | select('match', '^api_token=') | list | first | default('') }}"
+        __cf_from_string: "{{ (__cf_line_token.split('=') | last) if (__cf_line_token | length > 0) else ((__cf_line_apitoken.split('=') | last) if (__cf_line_apitoken | length > 0) else '') }}"
+        __cf_api_token_parsed: "{{ __cf_from_dict if (__cf_from_dict | length > 0) else __cf_from_string }}"
+      no_log: "{{ lookup('env', 'DEBUG') | default('0', true) != '1' }}"
+
+    - name: Require non-empty Cloudflare API token before creating Secret
+      ansible.builtin.assert:
+        that: __cf_api_token is defined and (__cf_api_token | length > 0)
+        fail_msg: "acme_plugin_data no contiene CF_Token ni api_token (dict o líneas CF_Token=...). El Secret de Cloudflare quedaría vacío y cert-manager fallaría con 'no Cloudflare credential has been given'."
+
+    # ClusterIssuer busca el Secret en el namespace cert-manager (cluster resource namespace).
+    - name: Create Cloudflare API token secret for cert-manager (used for issuance and renewals)
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "awx-{{ awx_instance_name }}-cloudflare-api"
+            namespace: cert-manager
+          type: Opaque
+          stringData:
+            api-token: "{{ __cf_api_token }}"
+        kubeconfig: "{{ awx_operator_kubeconfig }}"
+      no_log: "{{ lookup('env', 'DEBUG') | default('0', true) != '1' }}"
+
+    - name: Create ClusterIssuer for Let's Encrypt with Cloudflare DNS-01
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: cert-manager.io/v1
+          kind: ClusterIssuer
+          metadata:
+            name: "awx-{{ awx_instance_name }}-letsencrypt-cloudflare"
+          spec:
+            acme:
+              server: "{{ awx_ingress_acme_server | default('https://acme-v02.api.letsencrypt.org/directory') }}"
+              email: "{{ awx_ingress_acme_email }}"
+              privateKeySecretRef:
+                name: "awx-{{ awx_instance_name }}-acme-account"
+              solvers:
+                - dns01:
+                    cloudflare:
+                      apiTokenSecretRef:
+                        name: "awx-{{ awx_instance_name }}-cloudflare-api"
+                        key: api-token
+        kubeconfig: "{{ awx_operator_kubeconfig }}"
+
+    - name: Create Certificate for AWX ingress (cert-manager will create TLS secret)
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: cert-manager.io/v1
+          kind: Certificate
+          metadata:
+            name: "{{ awx_ingress_tls_secret }}"
+            namespace: "{{ awx_operator_namespace }}"
+          spec:
+            secretName: "{{ awx_ingress_tls_secret }}"
+            issuerRef:
+              name: "awx-{{ awx_instance_name }}-letsencrypt-cloudflare"
+              kind: ClusterIssuer
+            dnsNames:
+              - "{{ awx_ingress_hostname }}"
+        kubeconfig: "{{ awx_operator_kubeconfig }}"
+
+# --- HTTPS: cert_manager sin Cloudflare (HTTP-01) ---
+- name: Provision TLS via cert-manager HTTP-01 when cert_manager is true
+  when: awx_use_https | bool and cert_manager | bool and (dns_provider | default('')) != 'cloudflare'
+  block:
+    - name: Create ClusterIssuer for Let's Encrypt HTTP-01
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: cert-manager.io/v1
+          kind: ClusterIssuer
+          metadata:
+            name: "awx-{{ awx_instance_name }}-letsencrypt-http01"
+          spec:
+            acme:
+              server: "{{ awx_ingress_acme_server | default('https://acme-v02.api.letsencrypt.org/directory') }}"
+              email: "{{ awx_ingress_acme_email }}"
+              privateKeySecretRef:
+                name: "awx-{{ awx_instance_name }}-acme-account"
+              solvers:
+                - http01:
+                    ingress:
+                      class: nginx
+        kubeconfig: "{{ awx_operator_kubeconfig }}"
+
+    - name: Create Certificate for AWX ingress (HTTP-01; cert-manager will create TLS secret)
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: cert-manager.io/v1
+          kind: Certificate
+          metadata:
+            name: "{{ awx_ingress_tls_secret }}"
+            namespace: "{{ awx_operator_namespace }}"
+          spec:
+            secretName: "{{ awx_ingress_tls_secret }}"
+            issuerRef:
+              name: "awx-{{ awx_instance_name }}-letsencrypt-http01"
+              kind: ClusterIssuer
+            dnsNames:
+              - "{{ awx_ingress_hostname }}"
+        kubeconfig: "{{ awx_operator_kubeconfig }}"
+
+# --- Wait for TLS secret when using cert-manager (issuance can take several minutes: DNS-01/HTTP-01) ---
+# failed_when: false evita que k8s_info falle cuando el Secret aún no existe; until reintenta hasta que exista.
+- name: Wait for TLS secret created by cert-manager
+  when: >
+    awx_use_https | bool
+    and ((dns_provider | default('')) == 'cloudflare' or cert_manager | bool)
+    and awx_ingress_wait_for_tls_secret | bool
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Secret
+    name: "{{ awx_ingress_tls_secret }}"
+    namespace: "{{ awx_operator_namespace }}"
+    kubeconfig: "{{ awx_operator_kubeconfig }}"
+  register: __awx_tls_secret_check
+  failed_when: false
+  retries: "{{ awx_ingress_wait_tls_retries | int }}"
+  delay: "{{ awx_ingress_wait_tls_delay | int }}"
+  until: __awx_tls_secret_check.resources | default([]) | length > 0
+
+- name: Fail with clear message if TLS secret was not created by cert-manager
+  when: >
+    awx_use_https | bool
+    and ((dns_provider | default('')) == 'cloudflare' or cert_manager | bool)
+    and awx_ingress_wait_for_tls_secret | bool
+    and (__awx_tls_secret_check.resources | default([]) | length == 0)
+  ansible.builtin.fail:
+    msg: >-
+      El Secret TLS '{{ awx_ingress_tls_secret }}' no fue creado por cert-manager en el tiempo configurado.
+      Compruebe el Certificate: kubectl get certificate -n {{ awx_operator_namespace }}
+      y los eventos: kubectl describe certificate -n {{ awx_operator_namespace }}
+      Para omitir la espera y continuar (el Secret se creará más tarde), use awx_ingress_wait_for_tls_secret: false
+
+# Usar ingress_hosts (formato moderno) para que el operator genere el Ingress con TLS correctamente.
+# Siempre que awx_use_https sea true, forzamos ingress_type e ingress_hosts en el spec para que el CR
+# se despliegue con Ingress y TLS (evitar que quede ingress_type: none por vars previas).
+- name: Build awx_instance_spec with ingress and TLS when awx_use_https
+  when: awx_use_https | bool
+  ansible.builtin.set_fact:
+    awx_instance_spec: "{{ (awx_instance_spec | default({})) | combine({
+      'ingress_type': 'ingress',
+      'ingress_hosts': [{
+        'hostname': awx_ingress_hostname,
+        'tls_secret': awx_ingress_tls_secret
+      }]
+    }) }}"
+
 - name: Deploy AWX custom resource
   kubernetes.core.k8s:
     state: present
@@ -197,10 +531,12 @@
         __awx_service_ports: "{{ __awx_service_spec.ports | default([]) }}"
         __awx_service_ingress: "{{ __awx_service_status.loadBalancer.ingress | default([]) }}"
 
-    - name: Build AWX endpoint hint
+    - name: Build AWX endpoint hint (HTTPS when awx_use_https and hostname set)
       ansible.builtin.set_fact:
         awx_access_message: >-
-          {%- if __awx_service_type == 'NodePort' and __awx_service_ports | length > 0 and __awx_service_ports[0].nodePort is defined -%}
+          {%- if awx_use_https | bool and awx_ingress_hostname | default('') | length > 0 -%}
+          AWX available via Ingress with TLS. Access URL: https://{{ awx_ingress_hostname }}
+          {%- elif __awx_service_type == 'NodePort' and __awx_service_ports | length > 0 and __awx_service_ports[0].nodePort is defined -%}
           AWX available via NodePort. Access URL: http://{{ awx_operator_access_host }}:{{ __awx_service_ports[0].nodePort }}
           {%- elif __awx_service_type == 'LoadBalancer' and __awx_service_ingress | length > 0 -%}
           AWX available via LoadBalancer. Access URL: http://{{ __awx_service_ingress[0].hostname | default(__awx_service_ingress[0].ip, true) }}:{{ __awx_service_ports[0].port | default(80) }}
@@ -212,7 +548,9 @@
           Unable to determine AWX service endpoint automatically. Inspect service {{ awx_instance_name }}-service in namespace {{ awx_operator_namespace }}.
           {%- endif -%}
         awx_controller_url: >-
-          {%- if __awx_service_type == 'NodePort' and __awx_service_ports | length > 0 and __awx_service_ports[0].nodePort is defined -%}
+          {%- if awx_use_https | bool and awx_ingress_hostname | default('') | length > 0 -%}
+          https://{{ awx_ingress_hostname }}
+          {%- elif __awx_service_type == 'NodePort' and __awx_service_ports | length > 0 and __awx_service_ports[0].nodePort is defined -%}
           http://{{ awx_operator_access_host }}:{{ __awx_service_ports[0].nodePort }}
           {%- elif __awx_service_type == 'LoadBalancer' and __awx_service_ingress | length > 0 -%}
           http://{{ __awx_service_ingress[0].hostname | default(__awx_service_ingress[0].ip, true) }}:{{ __awx_service_ports[0].port | default(80) }}
@@ -221,7 +559,7 @@
           {%- else -%}
           {{ awx_controller_url | default('') }}
           {%- endif -%}
-        awx_controller_validate_certs: false
+        awx_controller_validate_certs: "{{ awx_controller_validate_certs | default(awx_use_https | bool) }}"
 
     - name: Display AWX access endpoint
       ansible.builtin.debug:
@@ -257,6 +595,7 @@
     - awx_operator_port_forward_enabled | bool
     - (__awx_service.resources | length > 0)
     - (__awx_service.resources[0].spec.type | default('ClusterIP')) == 'ClusterIP'
+    - not (awx_use_https | bool)
   block:
     - name: Ensure AWX port-forward Unit directory exists
       ansible.builtin.file:
