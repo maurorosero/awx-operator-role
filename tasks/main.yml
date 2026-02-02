@@ -23,7 +23,7 @@
   become: true
   become_user: "{{ awx_operator_admin_user }}"
   environment:
-    PATH: "/snap/bin:{{ ansible_env.PATH }}"
+    PATH: "/snap/bin:/usr/local/bin:/usr/bin:/bin"
   register: __awx_operator_nodes
   changed_when: false
   failed_when: >
@@ -46,7 +46,7 @@
   become: true
   become_user: "{{ awx_operator_admin_user }}"
   environment:
-    PATH: "/snap/bin:{{ ansible_env.PATH }}"
+    PATH: "/snap/bin:/usr/local/bin:/usr/bin:/bin"
   register: __awx_operator_pods
   changed_when: false
   failed_when: __awx_operator_pods.rc != 0
@@ -85,7 +85,7 @@
   become: true
   become_user: "{{ awx_operator_admin_user }}"
   environment:
-    PATH: "/snap/bin:{{ ansible_env.PATH }}"
+    PATH: "/snap/bin:/usr/local/bin:/usr/bin:/bin"
   register: __awx_operator_apply
   changed_when: __awx_operator_apply.stdout is search(' (configured|created)')
 
