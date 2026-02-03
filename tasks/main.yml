@@ -289,6 +289,20 @@
       retries: 30
       delay: 10
 
+# --- Comprobar si el Secret TLS ya existe (evitar recrear Certificate y agotar límites ACME) ---
+- name: Check if TLS secret already exists (skip Certificate creation if so)
+  when: >
+    awx_use_https | bool
+    and ((dns_provider | default('')) == 'cloudflare' or cert_manager | bool)
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Secret
+    name: "{{ awx_ingress_tls_secret }}"
+    namespace: "{{ awx_operator_namespace }}"
+    kubeconfig: "{{ awx_operator_kubeconfig }}"
+  register: __awx_tls_secret_exists
+  failed_when: false
+
 # --- HTTPS: Cloudflare (dns_provider=cloudflare): Secret de credenciales + ClusterIssuer DNS-01 + Certificate ---
 # El Secret de credenciales Cloudflare es usado por cert-manager para emisión y renovaciones; debe persistir.
 - name: Provision TLS via cert-manager Cloudflare DNS-01 when dns_provider is cloudflare
@@ -350,6 +364,7 @@
         kubeconfig: "{{ awx_operator_kubeconfig }}"
 
     - name: Create Certificate for AWX ingress (cert-manager will create TLS secret)
+      when: (__awx_tls_secret_exists.resources | default([]) | length) == 0
       kubernetes.core.k8s:
         state: present
         definition:
@@ -392,6 +407,7 @@
         kubeconfig: "{{ awx_operator_kubeconfig }}"
 
     - name: Create Certificate for AWX ingress (HTTP-01; cert-manager will create TLS secret)
+      when: (__awx_tls_secret_exists.resources | default([]) | length) == 0
       kubernetes.core.k8s:
         state: present
         definition:
@@ -416,6 +432,7 @@
     awx_use_https | bool
     and ((dns_provider | default('')) == 'cloudflare' or cert_manager | bool)
     and awx_ingress_wait_for_tls_secret | bool
+    and (__awx_tls_secret_exists.resources | default([]) | length == 0)
   kubernetes.core.k8s_info:
     api_version: v1
     kind: Secret
@@ -433,6 +450,7 @@
     awx_use_https | bool
     and ((dns_provider | default('')) == 'cloudflare' or cert_manager | bool)
     and awx_ingress_wait_for_tls_secret | bool
+    and (__awx_tls_secret_exists.resources | default([]) | length == 0)
     and (__awx_tls_secret_check.resources | default([]) | length == 0)
   ansible.builtin.fail:
     msg: >-
